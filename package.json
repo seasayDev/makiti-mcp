@@ -1,16 +1,16 @@
 {
   "name": "makiti-mcp",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Makiti — MCP shopping assistant powered by Hound: product search, compare, deals, price history",
+  "main": "server.js",
   "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node server.js",
+    "test": "node --test"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
+  "keywords": ["mcp", "shopping", "prices", "deals", "hound"],
+  "author": "seasayDev",
+  "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
     "pino": "^10.3.1",
