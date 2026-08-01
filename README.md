@@ -1,6 +1,6 @@
 # 🛒 Makiti — MCP Shopping Assistant
 
-**Makiti** est un serveur MCP (Model Context Protocol) qui agit comme assistant shopping intelligent.  
+**Makiti** est un serveur MCP (Model Context Protocol) qui agit comme assistant shopping intelligent.
 Il s’appuie sur **Hound** pour chercher le web et fournit des outils MCP pour :
 
 - 🔍 rechercher des produits,
@@ -25,18 +25,18 @@ npm install
 | Dépendance | Description |
 |---|---|
 | **Node.js >= 18** | Runtime requis |
-| **Hound MCP** | Serveur de recherche web tournant sur `http://localhost:8001` |
+| **Hound MCP** | Serveur MCP de recherche web (wrapper Hermes) |
 | **Hermes Agent** | Pour consommer les outils Makiti via MCP |
 
-### Lancer Hound
+### Architecture
 
-Makiti nécessite Hound en local. Assurez-vous qu’il écoute sur le port `8001`.
+Makiti ne parle pas à Hound par HTTP : il **spawn Hound en sous-processus** et
+communique en **JSON-RPC stdio** (protocole MCP), exactement comme le fait Hermes.
+Le chemin du wrapper Hound est configurable via la variable d'environnement
+`HOUND_WRAPPER` (défaut : `/data/data/com.termux/files/home/.hermes/scripts/hound-wrapper.sh`).
 
-```bash
-# Exemple (selon ta config Hound)
-cd ~/projects/hound-mcp
-npm run start
-# → http://localhost:8001
+```
+[ Agent / Hermes ] ──stdio──> [ Makiti MCP ] ──spawn──> [ Hound MCP ] ──> web
 ```
 
 ---
@@ -109,35 +109,44 @@ Dans `~/.hermes/config.yaml`, ajoute :
 
 ```yaml
 mcp_servers:
-  - name: makiti
+  makiti:
     command: node
     args: ["/chemin/absolu/vers/makiti-mcp/server.js"]
-    env:
-      HOUND_URL: "http://localhost:8001"
 ```
 
 Puis redémarre Hermes :
 
 ```bash
-hermes restart
+hermes gateway restart   # depuis un shell Termux, pas depuis le chat
+```
+
+Vérification :
+
+```bash
+hermes mcp list          # makiti doit apparaître ✓ enabled
+hermes mcp test makiti   # ✓ Connected + tools discovered
 ```
 
 ---
 
-## 🧪 Test rapide
+## 🧪 Développement / test
 
 ```bash
-# Vérifier que le serveur répond
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' | node server.js
+# Vérifier le handshake MCP + un outil réel
+printf '%s\n%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"product_search","arguments":{"query":"iPhone 15","limit":3}}}' \
+  | timeout 100 node server.js
 ```
+
+> ⚠️ Hound démarre en ~15 s au premier appel (proot Ubuntu). Patience sur le premier `tools/call`.
 
 ---
 
 ## 🔧 Scripts npm
 
 ```bash
-npm start          # lancer le serveur MCP
-npm test           # placeholder (ajouter des tests plus tard)
+npm start   # lancer le serveur MCP (alias node server.js)
 ```
 
 ---
