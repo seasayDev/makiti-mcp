@@ -124,18 +124,42 @@ export class HoundClient {
     return result;
   }
 
-  /** smart_search → array of {title,url,snippet,relevance_score,...} */
+  /** smart_search → array of {title,url,snippet,relevance_score,...}
+   *  With automatic engine fallback: if the requested engines are blocked
+   *  or return zero results, retry with a different engine set.
+   */
   async search(query, opts = {}) {
-    const sc = await this.callTool('mcp_smart_search', {
-      query,
-      options: {
-        max_results: opts.max_results ?? 8,
-        engines: opts.engines ?? ['google', 'brave', 'duckduckgo', 'yahoo'],
-        ...(opts.freshness ? { freshness: opts.freshness } : {}),
-        ...(opts.site ? { site: opts.site } : {}),
-      },
-    });
-    return sc?.results || [];
+    const engineTiers = [
+      opts.engines ?? ['google', 'brave', 'duckduckgo', 'yahoo'],
+      ['duckduckgo', 'yahoo', 'qwant', 'mojeek'],
+      ['startpage', 'bing'],
+    ];
+
+    let lastError = null;
+    for (const engines of engineTiers) {
+      try {
+        const sc = await this.callTool('mcp_smart_search', {
+          query,
+          options: {
+            max_results: opts.max_results ?? 8,
+            engines,
+            ...(opts.freshness ? { freshness: opts.freshness } : {}),
+            ...(opts.site ? { site: opts.site } : {}),
+          },
+        });
+        const results = sc?.results || [];
+        // If we got results, or no engine was blocked, stop here
+        if (results.length > 0 || !sc?.engine_blocked?.length) {
+          return results;
+        }
+        // engines blocked and zero results → try next tier
+        lastError = new Error(`engines blocked: ${sc.engine_blocked.join(', ')}`);
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    if (lastError) throw lastError;
+    return [];
   }
 
   /** smart_fetch → extracted page content */
