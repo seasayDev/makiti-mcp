@@ -332,9 +332,9 @@ function findTitle(lines, priceIdx) {
     if (/^\(\d+(?:[.,]\d+)?k?\)/i.test(t)) continue;                     // "(65.3K)"
     if (/^\d+\+ bought in past month/i.test(t)) continue;                // "500+ bought in past month"
     if (/^\d+ sizes?$/i.test(t)) continue;                               // "2 sizes", "4 sizes"
-    if (/^(tomorrow|today|sunday|monday|tuesday|wednesday|thursday|friday|saturday),/i.test(t)) continue; // "Tomorrow, Aug 1"
+    if (/^(tomorrow|today|sunday|monday|tuesday|wednesday|thursday|friday|saturday|sun|mon|tue|wed|thu|fri|sat),/i.test(t)) continue; // "Tomorrow, Aug 1" / "Tue, Aug 4"
     if (/^\d+(?:[.,]\d+)? out of 5 stars?/i.test(t)) continue;          // "4.4 out of 5 stars"
-    if (/^(amazon's choice|bestseller|highly rated|sponsored|or fastest|free delivery|free pickup)/i.test(t)) continue;
+    if (/^(amazon's choice|bestseller|highly rated|sponsored|or fastest|free delivery|free pickup|on your first|your first order)/i.test(t)) continue;
     if (t.length > 5 && t.length < 200 && !/^\$/.test(t)) return t;
   }
   return null;
