@@ -4,16 +4,18 @@
  * Shopping assistant MCP that uses Hound under the hood for product search,
  * price comparison, deal hunting, and price tracking.
  *
- * Transport: stdio
- * Protocol: MCP (Model Context Protocol)
+ * Transport: stdio (MCP)
+ * Hound: spawned as a child MCP process (JSON-RPC over stdio)
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import pino from 'pino';
+import { HoundClient } from './hound-client.js';
 
 const logger = pino({ level: 'silent' });
+const hound = new HoundClient();
 
 // ---------------------------------------------------------------------------
 // MCP Server
@@ -24,9 +26,7 @@ const server = new McpServer(
     version: '1.0.0',
   },
   {
-    capabilities: {
-      tools: {},
-    },
+    capabilities: { tools: {} },
   }
 );
 
@@ -34,37 +34,52 @@ const server = new McpServer(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Build a Google Shopping-style search query.
- */
-function buildShoppingQuery(baseQuery, options = {}) {
-  const { maxPrice, minPrice, brand, site, condition } = options;
-  const parts = [baseQuery];
-  if (brand) parts.push(`site:${brand.toLowerCase()}.com OR ${brand}`);
-  if (site) parts.push(`site:${site}`);
-  if (condition) parts.push(condition);
-  return parts.join(' ');
+function extractRetailer(url) {
+  try {
+    const hostname = new URL(url).hostname.replace('www.', '');
+    const known = {
+      'amazon.ca': 'Amazon Canada', 'amazon.com': 'Amazon',
+      'bestbuy.ca': 'Best Buy Canada', 'bestbuy.com': 'Best Buy',
+      'walmart.ca': 'Walmart Canada', 'walmart.com': 'Walmart',
+      'canadiantire.ca': 'Canadian Tire', 'newegg.ca': 'Newegg Canada',
+      'newegg.com': 'Newegg', 'costco.ca': 'Costco Canada', 'costco.com': 'Costco',
+      'target.com': 'Target', 'homedepot.ca': 'Home Depot Canada',
+      'lows.com': "Lowe's", 'staples.ca': 'Staples Canada',
+      'thesource.ca': 'The Source', 'dollarama.com': 'Dollarama',
+      'aliexpress.com': 'AliExpress', 'ebay.ca': 'eBay Canada',
+    };
+    return known[hostname] || hostname;
+  } catch {
+    return 'Unknown';
+  }
 }
 
-/**
- * Build a price-tracking query across multiple retailers.
- */
-function buildPriceTrackingQuery(product, retailers = []) {
-  const sites = retailers.length > 0 ? retailers : ['amazon.com', 'bestbuy.com', 'walmart.com', 'newegg.com', 'canadiantire.ca'];
-  const siteFilters = sites.map(s => `site:${s}`).join(' OR ');
-  return `${product} price ${siteFilters}`;
+function detectDealIndicators(text) {
+  const keywords = ['sale', 'deal', 'discount', 'promo', 'coupon', 'clearance', 'rabais', 'offre', 'réduction', 'black friday', 'boxing week', 'cyber monday', 'save', 'free shipping', 'livraison gratuite', 'promotion'];
+  const lower = text.toLowerCase();
+  return keywords.filter(k => lower.includes(k));
 }
 
-/**
- * Build a deal-hunting query.
- */
-function buildDealsQuery(category, region = 'Canada') {
-  const queries = [
-    `${category} deals ${region}`,
-    `${category} promo ${region}`,
-    `${category} rabais Québec Canada`,
-  ];
-  return queries;
+async function multiSearch(queries, opts = {}) {
+  const results = [];
+  for (const q of queries) {
+    try {
+      const res = await hound.search(q, opts);
+      results.push(...res);
+    } catch (err) {
+      logger.error({ err: err.message, q }, 'hound search failed');
+    }
+  }
+  // Dedupe by URL
+  const seen = new Set();
+  const unique = [];
+  for (const r of results) {
+    if (r.url && !seen.has(r.url)) {
+      seen.add(r.url);
+      unique.push(r);
+    }
+  }
+  return unique;
 }
 
 // ---------------------------------------------------------------------------
@@ -83,72 +98,28 @@ server.tool(
     limit: z.number().optional().describe('Max number of results to return (default 10)'),
   },
   async ({ query, max_price, min_price, brand, retailer, condition, limit = 10 }) => {
-    const shoppingQuery = buildShoppingQuery(query, { maxPrice: max_price, minPrice: min_price, brand, site: retailer, condition });
+    const parts = [query];
+    if (brand) parts.push(`${brand}`);
+    if (retailer) parts.push(`site:${retailer}`);
+    if (condition) parts.push(condition);
+    if (min_price) parts.push(`$${min_price}+`);
+    if (max_price) parts.push(`under $${max_price}`);
+    const base = parts.join(' ');
 
-    const houndQueries = [
-      `${shoppingQuery} price CAD Canada`,
-      `${shoppingQuery} buy online`,
+    const queries = [
+      `${base} price Canada`,
+      `${base} buy online`,
     ];
 
-    const results = [];
-    for (const q of houndQueries) {
-      try {
-        const resp = await fetch('http://localhost:8001/v1/tools/mcp__hound__mcp_smart_search', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            jsonrpc: '2.0',
-            id: Date.now() + Math.random(),
-            method: 'tools/call',
-            params: {
-              name: 'mcp__hound__mcp_smart_search',
-              arguments: {
-                query: q,
-                options: {
-                  max_results: limit,
-                  freshness: 'week',
-                  engines: ['google', 'brave', 'ddg', 'yahoo'],
-                },
-              },
-            },
-          }),
-        });
-        if (!resp.ok) continue;
-        const data = await resp.json();
-        if (data.result?.content) {
-          for (const block of data.result.content) {
-            if (block.type === 'text') {
-              try {
-                const parsed = JSON.parse(block.text);
-                if (parsed.data?.web) results.push(...parsed.data.web);
-              } catch {
-                // skip non-json blocks
-              }
-            }
-          }
-        }
-      } catch (err) {
-        logger.error({ err: err.message }, 'search query failed');
-      }
-    }
+    const results = await multiSearch(queries, { max_results: limit, freshness: 'week' });
 
-    // Deduplicate by URL
-    const seen = new Set();
-    const unique = [];
-    for (const r of results) {
-      const key = r.url;
-      if (!seen.has(key)) {
-        seen.add(key);
-        unique.push(r);
-      }
-    }
-
-    const formatted = unique.slice(0, limit).map((r, i) => ({
+    const formatted = results.slice(0, limit).map((r, i) => ({
       rank: i + 1,
       title: r.title,
       url: r.url,
-      snippet: r.description,
+      snippet: r.snippet,
       retailer: extractRetailer(r.url),
+      relevance: r.relevance_score,
     }));
 
     const output = {
@@ -157,15 +128,13 @@ server.tool(
       total_results: formatted.length,
       results: formatted,
       tips: [
-        'Click links to verify current prices — listings may have changed.',
-        'Use product_compare to side-by-side two items.',
-        'Use find_deals to hunt for promotions.',
+        'Prices are NOT guaranteed — open the links to verify current price, taxes and shipping.',
+        'Use product_compare to compare two items side-by-side.',
+        'Use find_deals to hunt promotions on this product.',
       ],
     };
 
-    return {
-      content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
-    };
+    return { content: [{ type: 'text', text: JSON.stringify(output, null, 2) }] };
   }
 );
 
@@ -183,66 +152,34 @@ server.tool(
   },
   async ({ product_a, product_b, category, budget }) => {
     const queries = [
-      `${product_a} vs ${product_b} specs review`,
-      `${product_a} price CAD`,
-      `${product_b} price CAD`,
-      `${product_a} ${product_b} comparison ${category || ''}`,
+      `${product_a} vs ${product_b} comparison review ${category || ''}`,
+      `${product_a} price CAD Canada`,
+      `${product_b} price CAD Canada`,
     ];
 
-    const allResults = [];
-    for (const q of queries) {
-      try {
-        const resp = await fetch('http://localhost:8001/v1/tools/mcp__hound__mcp_smart_search', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            jsonrpc: '2.0',
-            id: Date.now() + Math.random(),
-            method: 'tools/call',
-            params: {
-              name: 'mcp__hound__mcp_smart_search',
-              arguments: {
-                query: q,
-                options: { max_results: 8, freshness: 'month', engines: ['google', 'brave', 'ddg'] },
-              },
-            },
-          }),
-        });
-        if (!resp.ok) continue;
-        const data = await resp.json();
-        if (data.result?.content) {
-          for (const block of data.result.content) {
-            if (block.type === 'text') {
-              try {
-                const parsed = JSON.parse(block.text);
-                if (parsed.data?.web) allResults.push(...parsed.data.web);
-              } catch { /* skip */ }
-            }
-          }
-        }
-      } catch (err) {
-        logger.error({ err: err.message }, 'compare query failed');
-      }
-    }
+    const results = await multiSearch(queries, { max_results: 8, freshness: 'month' });
 
-    const seen = new Set();
-    const unique = [];
-    for (const r of allResults) {
-      if (!seen.has(r.url)) { seen.add(r.url); unique.push(r); }
-    }
+    const matchA = (r) => (r.title + ' ' + (r.snippet || '')).toLowerCase().includes(product_a.toLowerCase());
+    const matchB = (r) => (r.title + ' ' + (r.snippet || '')).toLowerCase().includes(product_b.toLowerCase());
 
     const output = {
       product_a,
       product_b,
       category,
       budget,
-      sources_found: unique.length,
+      sources_found: results.length,
       comparison: {
-        product_a: { name: product_a, evidence: unique.filter(r => r.title.toLowerCase().includes(product_a.toLowerCase()) || r.description.toLowerCase().includes(product_a.toLowerCase())).slice(0, 5).map(r => ({ title: r.title, url: r.url, snippet: r.description })) },
-        product_b: { name: product_b, evidence: unique.filter(r => r.title.toLowerCase().includes(product_b.toLowerCase()) || r.description.toLowerCase().includes(product_b.toLowerCase())).slice(0, 5).map(r => ({ title: r.title, url: r.url, snippet: r.description })) },
+        product_a: {
+          name: product_a,
+          evidence: results.filter(matchA).slice(0, 5).map(r => ({ title: r.title, url: r.url, snippet: r.snippet })),
+        },
+        product_b: {
+          name: product_b,
+          evidence: results.filter(matchB).slice(0, 5).map(r => ({ title: r.title, url: r.url, snippet: r.snippet })),
+        },
       },
-      verdict: generateVerdict(unique, product_a, product_b, budget),
-      sources: unique.slice(0, 10).map(r => ({ title: r.title, url: r.url })),
+      verdict: generateVerdict(results, product_a, product_b, budget),
+      sources: results.slice(0, 10).map(r => ({ title: r.title, url: r.url, retailer: extractRetailer(r.url) })),
     };
 
     return { content: [{ type: 'text', text: JSON.stringify(output, null, 2) }] };
@@ -262,59 +199,22 @@ server.tool(
     limit: z.number().optional().describe('Max deals to return (default 10)'),
   },
   async ({ query, region = 'Canada', retailer, limit = 10 }) => {
-    const dealQueries = buildDealsQuery(query, region);
-    if (retailer) dealQueries.push(`${query} deals site:${retailer}`);
+    const queries = [
+      `${query} deals ${region}`,
+      `${query} promo coupon discount`,
+      `${query} rabais promotion Québec`,
+    ];
+    if (retailer) queries.push(`${query} deals site:${retailer}`);
 
-    const allResults = [];
-    for (const q of dealQueries) {
-      try {
-        const resp = await fetch('http://localhost:8001/v1/tools/mcp__hound__mcp_smart_search', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            jsonrpc: '2.0',
-            id: Date.now() + Math.random(),
-            method: 'tools/call',
-            params: {
-              name: 'mcp__hound__mcp_smart_search',
-              arguments: {
-                query: q,
-                options: { max_results: limit, freshness: 'day', engines: ['google', 'brave', 'ddg', 'yahoo'] },
-              },
-            },
-          }),
-        });
-        if (!resp.ok) continue;
-        const data = await resp.json();
-        if (data.result?.content) {
-          for (const block of data.result.content) {
-            if (block.type === 'text') {
-              try {
-                const parsed = JSON.parse(block.text);
-                if (parsed.data?.web) allResults.push(...parsed.data.web);
-              } catch { /* skip */ }
-            }
-          }
-        }
-      } catch (err) {
-        logger.error({ err: err.message }, 'deal search failed');
-      }
-    }
+    const results = await multiSearch(queries, { max_results: limit, freshness: 'day' });
 
-    const seen = new Set();
-    const unique = [];
-    for (const r of allResults) {
-      if (!seen.has(r.url)) { seen.add(r.url); unique.push(r); }
-    }
-
-    // Detect promo indicators
-    const deals = unique.slice(0, limit).map((r, i) => ({
+    const deals = results.slice(0, limit).map((r, i) => ({
       rank: i + 1,
       title: r.title,
       url: r.url,
-      snippet: r.description,
+      snippet: r.snippet,
       retailer: extractRetailer(r.url),
-      deal_indicators: detectDealIndicators(r.title + ' ' + r.description),
+      deal_indicators: detectDealIndicators((r.title || '') + ' ' + (r.snippet || '')),
     }));
 
     const output = {
@@ -327,7 +227,7 @@ server.tool(
         'Check coupon sites like RedFlagDeals, Save.ca, CouponFollow for promo codes.',
         'Price-match policies at Best Buy Canada and Visions can save extra.',
         'Black Friday / Boxing Week often yields deepest discounts.',
-        'Use browser extensions like Honey or Rakuten for cashback.',
+        'Use cashback portals (Rakuten, TopCashback) for extra savings.',
       ],
     };
 
@@ -347,56 +247,36 @@ server.tool(
     days_back: z.number().optional().describe('How many days of history to estimate (default 90)'),
   },
   async ({ product, retailers, days_back = 90 }) => {
-    const query = buildPriceTrackingQuery(product, retailers);
-    try {
-      const resp = await fetch('http://localhost:8001/v1/tools/mcp__hound__mcp_smart_search', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: Date.now() + Math.random(),
-          method: 'tools/call',
-          params: {
-            name: 'mcp__hound__mcp_smart_search',
-            arguments: {
-              query: `${query} price history`,
-              options: { max_results: 10, freshness: 'month', engines: ['google', 'brave'] },
-            },
-          },
-          }),
-        });
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      const data = await resp.json();
-      let results = [];
-      if (data.result?.content) {
-        for (const block of data.result.content) {
-          if (block.type === 'text') {
-            try { results.push(...JSON.parse(block.text).data.web); } catch { /* skip */ }
-          }
-        }
-      }
+    const retailersList = retailers || ['amazon.ca', 'bestbuy.ca', 'walmart.ca', 'canadiantire.ca', 'newegg.ca'];
+    const queries = [
+      `${product} price Canada`,
+      `${product} ${retailersList.slice(0, 3).map(s => `site:${s}`).join(' OR ')}`,
+      `${product} price history tracking`,
+    ];
 
-      const seen = new Set();
-      const unique = results.filter(r => { if (seen.has(r.url)) return false; seen.add(r.url); return true; });
+    const results = await multiSearch(queries, { max_results: 10, freshness: 'month' });
 
-      const output = {
-        product,
-        retailers: retailers || ['amazon.ca', 'bestbuy.ca', 'walmart.ca', 'canadiantire.ca', 'newegg.ca'],
-        period_days: days_back,
-        price_tracking_tips: [
-          'Install CamelCamelCamel browser extension for Amazon price history.',
-          'Use PriceSpy or Google Shopping for cross-retailer tracking.',
-          'Set price alerts on deal forums like RedFlagDeals.',
-          'Many retailers price-match — check policy before buying.',
-        ],
-        current_listings: unique.slice(0, 10).map(r => ({ title: r.title, url: r.url, snippet: r.description, retailer: extractRetailer(r.url) })),
-        assessment: 'Use the listings above plus browser tools for exact current prices. Compare against known MSRP to judge deal quality.',
-      };
+    const output = {
+      product,
+      retailers: retailersList,
+      period_days: days_back,
+      current_listings: results.slice(0, 10).map(r => ({
+        title: r.title,
+        url: r.url,
+        snippet: r.snippet,
+        retailer: extractRetailer(r.url),
+        relevance: r.relevance_score,
+      })),
+      price_tracking_tips: [
+        'Install CamelCamelCamel browser extension for Amazon price history.',
+        'Use PriceSpy or Google Shopping for cross-retailer tracking.',
+        'Set price alerts on deal forums like RedFlagDeals.',
+        'Many retailers price-match — check policy before buying.',
+      ],
+      assessment: 'Use the listings above plus smart_fetch on the links for exact current prices. Compare against known MSRP to judge deal quality.',
+    };
 
-      return { content: [{ type: 'text', text: JSON.stringify(output, null, 2) }] };
-    } catch (err) {
-      return { content: [{ type: 'text', text: JSON.stringify({ error: err.message, product, tip: 'Check Hound server is running on :8001' }, null, 2) }] };
-    }
+    return { content: [{ type: 'text', text: JSON.stringify(output, null, 2) }] };
   }
 );
 
@@ -411,7 +291,7 @@ server.tool(
   },
   async ({ scenario }) => {
     const guide = {
-      overview: 'Makiti uses Hound web search to find real product data across Canadian and international retailers.',
+      overview: 'Makiti uses Hound (web search + fetch) to find real product data across Canadian and international retailers.',
       workflow: {
         step_1: 'Use product_search with filters (price, brand, retailer) to find candidates.',
         step_2: 'Use product_compare to weigh two top options side-by-side.',
@@ -438,40 +318,9 @@ server.tool(
 // Internal utilities
 // ---------------------------------------------------------------------------
 
-function extractRetailer(url) {
-  try {
-    const hostname = new URL(url).hostname.replace('www.', '');
-    const known = {
-      'amazon.ca': 'Amazon Canada',
-      'amazon.com': 'Amazon',
-      'bestbuy.ca': 'Best Buy Canada',
-      'bestbuy.com': 'Best Buy',
-      'walmart.ca': 'Walmart Canada',
-      'walmart.com': 'Walmart',
-      'canadiantire.ca': 'Canadian Tire',
-      'newegg.ca': 'Newegg Canada',
-      'newegg.com': 'Newegg',
-      'costco.ca': 'Costco Canada',
-      'costco.com': 'Costco',
-      'target.com': 'Target',
-      'homedepot.ca': 'Home Depot Canada',
-      'lowe\'s.com': "Lowe's",
-    };
-    return known[hostname] || hostname;
-  } catch {
-    return 'Unknown';
-  }
-}
-
-function detectDealIndicators(text) {
-  const keywords = ['sale', 'deal', 'discount', 'promo', 'coupon', 'clearance', 'rabais', 'offre', 'réduction', 'black friday', 'boxing week', 'cyber monday', 'save', 'free shipping'];
-  const lower = text.toLowerCase();
-  return keywords.filter(k => lower.includes(k));
-}
-
 function generateVerdict(results, productA, productB, budget) {
-  const aResults = results.filter(r => r.title.toLowerCase().includes(productA.toLowerCase()) || r.description.toLowerCase().includes(productA.toLowerCase()));
-  const bResults = results.filter(r => r.title.toLowerCase().includes(productB.toLowerCase()) || r.description.toLowerCase().includes(productB.toLowerCase()));
+  const aResults = results.filter(r => (r.title + ' ' + (r.snippet || '')).toLowerCase().includes(productA.toLowerCase()));
+  const bResults = results.filter(r => (r.title + ' ' + (r.snippet || '')).toLowerCase().includes(productB.toLowerCase()));
 
   let verdict = '';
   if (aResults.length > bResults.length) {
@@ -479,7 +328,7 @@ function generateVerdict(results, productA, productB, budget) {
   } else if (bResults.length > aResults.length) {
     verdict = `${productB} has more recent coverage. Consider if that translates to better availability.`;
   } else {
-    verdict = `Both products have similar web presence. Use product-specific criteria (budget, features, warranty) to decide.`;
+    verdict = 'Both products have similar web presence. Use product-specific criteria (budget, features, warranty) to decide.';
   }
 
   if (budget) {
@@ -490,8 +339,8 @@ function generateVerdict(results, productA, productB, budget) {
 }
 
 // ---------------------------------------------------------------------------
-// Start server
+// Start server (hound connects lazily on first tool call)
 // ---------------------------------------------------------------------------
 const transport = new StdioServerTransport();
 await server.connect(transport);
-logger.info('Makiti MCP server running on stdio');
+logger.info('Makiti MCP server running on stdio (hound lazy-connect)');
